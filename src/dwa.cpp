@@ -2,6 +2,8 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include<cmath>
+#include<iostream>
 
 #include "rclcpp/rclcpp.hpp"
 #include"sensor_msgs/msg/laser_scan.hpp"
@@ -14,7 +16,9 @@
 
 using namespace std::chrono_literals;
 
-
+Twist robot_vel;
+std::vector<Pose2D> predict_path;
+Twist prev_vel;
 class DWANode : public rclcpp::Node
 {
   public:
@@ -27,32 +31,33 @@ class DWANode : public rclcpp::Node
         laser_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
             "scan", 10, std::bind(&DWANode::laser_callback, this, std::placeholders::_1));
     }
-    double robot_radius = 0.55;
-    double predict_time = 1.5;
+    double robot_radius = 0.05;
+    double predict_time = 2.0;
     obstacles obs;
     Pose2D robot_pose;
-    Twist robot_vel;
-    std::vector<Pose2D> predict_path;
-    Twist prev_vel;
     Pose2D goall;
     double dt = 0.1;
     double max_linear_vel = 0.5;
-    double min_linear_vel = 0.2;
+    double min_linear_vel = 0.0;
     double max_angular_vel = 0.5;
     double min_angular_vel = -0.5; 
     double resolution = 20;
+    double w_obs = 1.0;
+    double w_goal = 10.0;
+    double w_velocity = 0.1;
 
     double max_acc_linear = 1.5;
     double min_acc_linear = -3.5;
     double max_acc_angular = 1.5;
     double min_acc_angular = -3.5;
-    DynamicWindow calculate_window()
+    DynamicWindow calculate_window(Twist prev_vel)
     {
         DynamicWindow dw;
-        dw.linear_min_vel = std::max(min_linear_vel, robot_vel.linear - max_acc_linear * dt);
-        dw.linear_max_vel = std::min(max_linear_vel, robot_vel.linear + max_acc_linear * dt);
-        dw.angular_min_vel = std::max(min_angular_vel, robot_vel.angular - max_acc_angular * dt);
-        dw.angular_max_vel = std::min(max_angular_vel, robot_vel.angular + max_acc_angular * dt);
+        std::cout<<robot_vel.linear<<std::endl;
+        dw.linear_min_vel = std::max(min_linear_vel, prev_vel.linear - max_acc_linear * dt);
+        dw.linear_max_vel = std::min(max_linear_vel, prev_vel.linear + max_acc_linear * dt);
+        dw.angular_min_vel = std::max(min_angular_vel, prev_vel.angular - max_acc_angular * dt);
+        dw.angular_max_vel = std::min(max_angular_vel, prev_vel.angular + max_acc_angular * dt);
         return dw;
     }
     double quat2theta(const geometry_msgs::msg::Quaternion q) const
@@ -62,23 +67,22 @@ class DWANode : public rclcpp::Node
         tf2::Matrix3x3(tf_q).getRPY(roll, pitch, yaw);
         return yaw;
     }
-    bool check_collide(const Pose2D robot_pose)
+bool check_collide(const Pose2D &robot_pose)
+{
+    for (auto ob : obs)
     {
-        for (auto ob : obs)
+        double dist = std::sqrt(
+            std::pow(ob.position.x - robot_pose.position.x, 2) +
+            std::pow(ob.position.y - robot_pose.position.y, 2)
+        );
+        if (dist < robot_radius)
         {
-            if(std::sqrt(std::pow(ob.position.x - robot_pose.position.x, 2) + 
-                std::pow(ob.position.y - robot_pose.position.y, 2)) < robot_radius)
-            {
-                std::cout<<"COLLIDE"<<std::endl;
-                return true;
-
-            }
-            else
-            {
-                return false;
-            }
+            std::cout << "COLLIDE" << std::endl;
+            return true;
         }
     }
+    return false;
+}
     double calculate_min_distance(const Pose2D robot_pose)
     {
         double min_dist = 1000;
@@ -130,7 +134,8 @@ class DWANode : public rclcpp::Node
         {
             if (check_collide(pose))
             {
-                cost += 10;
+                cost += 10000;
+                break;
             }
             else{
                 cost += 1/calculate_min_distance(pose);
@@ -144,10 +149,49 @@ class DWANode : public rclcpp::Node
         return std::sqrt(std::pow(goal.position.x - robot_pose.position.x, 2) + 
                 std::pow(goal.position.y - robot_pose.position.y, 2));
     }
+
+    double calculate_heading_cost(PredictPath p)
+    {
+        double cost = 0.0;
+        for (auto pose:p)
+        {
+            float dx = goall.position.x - pose.position.x;
+            float dy = goall.position.y - pose.position.y;
+            cost += std::abs(pose.theta - atan2(dy,dx));
+        }
+        return cost;
+    }
     double calculate_velocity_cost(Twist v, Twist prev_v)
     {
         return std::sqrt(std::pow(v.linear - prev_v.linear, 2) + 
                 std::pow(v.angular - prev_v.angular, 2));
+    }
+    Twist DWA(ReachableVelocity vel, Pose2D goal)
+    {
+        double o_cost, g_cost, v_cost, h_cost;
+        double min_cost = 1000;
+        Twist best_vel;
+        for (auto v: vel)
+        {
+            PredictPath p = predict_trajectory(v);
+            double obstacle_cost = calculate_obstacle_cost(p);
+            double goal_cost = calculate_goal_cost(goal, p.back());
+            double velocity_cost = calculate_velocity_cost(v, prev_vel);
+            double heading_cost = calculate_heading_cost(p);
+            double final_cost = w_obs * obstacle_cost + w_goal * goal_cost +velocity_cost * w_velocity + 10*heading_cost*w_goal;
+            if (final_cost < min_cost)
+            {
+                min_cost = final_cost;
+                best_vel = v;
+                o_cost = obstacle_cost;
+                g_cost = goal_cost;
+                v_cost = velocity_cost;
+                h_cost = heading_cost;
+            }
+        }
+        std::cout<<"Best Velocity: "<<best_vel.linear<<" "<<best_vel.angular<<std::endl;
+        std::cout<<"O: "<<o_cost<<" G: "<<g_cost<<" V: "<<v_cost<<" H: "<<h_cost<<std::endl;
+        return best_vel;
     }
 
     void laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) 
@@ -184,31 +228,6 @@ class DWANode : public rclcpp::Node
         }
         // std::cout<<obs[3].position.x<<std::endl;
     }
-    Twist DWA(ReachableVelocity vel, Pose2D goal)
-    {
-        double o_cost, g_cost, v_cost;
-        double min_cost = 1000;
-        Twist best_vel;
-        for (auto v: vel)
-        {
-            PredictPath p = predict_trajectory(v);
-            double obstacle_cost = calculate_obstacle_cost(p);
-            double goal_cost = calculate_goal_cost(goal, p.back());
-            double velocity_cost = calculate_velocity_cost(v, prev_vel);
-            double final_cost = obstacle_cost + goal_cost + velocity_cost;
-            if (final_cost < min_cost)
-            {
-                min_cost = final_cost;
-                best_vel = v;
-                o_cost = obstacle_cost;
-                g_cost = goal_cost;
-                v_cost = velocity_cost;
-            }
-        }
-        std::cout<<"Best Velocity: "<<best_vel.linear<<" "<<best_vel.angular<<std::endl;
-        std::cout<<"O: "<<o_cost<<" G: "<<g_cost<<" V: "<<v_cost<<std::endl;
-        return best_vel;
-    }
     void visualise()
     {
         cv::Mat map = cv::Mat::zeros(1000, 1000, CV_8UC3);
@@ -238,15 +257,15 @@ class DWANode : public rclcpp::Node
         robot_pose.position.y = msg->pose.pose.position.y;
         robot_pose.theta = quat2theta(msg->pose.pose.orientation);
 
-        DynamicWindow dw = calculate_window();
+        DynamicWindow dw = calculate_window(prev_vel);
         ReachableVelocity vel = calculate_reachable_velocity(dw);
         std::cout<<"Num Obstacles: "<<obs.size()<<std::endl;
         std::cout<<"Min Linear: "<<dw.linear_min_vel<<" Max Linear: "<<dw.linear_max_vel<<" Min Angular: "<<dw.angular_min_vel<<" Max Angular: "<<dw.angular_max_vel<<std::endl;
         Twist robot_vel = DWA(vel, goall);
 
         geometry_msgs::msg::Twist cmd_msg;
-        cmd_msg.linear.x = 0.0;
-        cmd_msg.angular.z = 0.0;
+        cmd_msg.linear.x = robot_vel.linear;
+        cmd_msg.angular.z = robot_vel.angular;
         cmd_pub_ ->publish(cmd_msg);
         prev_vel = robot_vel;
         visualise();
